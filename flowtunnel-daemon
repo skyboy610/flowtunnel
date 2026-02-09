@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""
+FlowTunnel Advanced Anti-DPI Daemon
+Features: Connection rotation, traffic obfuscation, random delays, chunk randomization
+"""
+
+import socket
+import select
+import threading
+import time
+import random
+import sys
+import signal
+import os
+import struct
+from collections import deque
+
+class AdvancedRotator:
+    def __init__(self, listen_port, backend_host, backend_port, rotation_interval=30):
+        self.listen_port = listen_port
+        self.backend_host = backend_host
+        self.backend_port = backend_port
+        self.rotation_interval = rotation_interval
+        self.running = True
+        self.active_connections = {}
+        self.stats = {
+            'total_connections': 0,
+            'total_bytes_sent': 0,
+            'total_bytes_received': 0,
+            'rotations': 0
+        }
+        
+    def random_delay(self):
+        """Add random microsecond delay to break timing patterns"""
+        time.sleep(random.uniform(0.0001, 0.001))
+    
+    def chunk_randomize(self, data, chunk_size=1400):
+        """Split data into random-sized chunks to break packet patterns"""
+        if len(data) <= chunk_size:
+            return [data]
+        
+        chunks = []
+        pos = 0
+        while pos < len(data):
+            # Random chunk size between 500-1400 bytes
+            size = min(random.randint(500, chunk_size), len(data) - pos)
+            chunks.append(data[pos:pos+size])
+            pos += size
+        
+        return chunks
+    
+    def obfuscate_packet(self, data):
+        """
+        Simple packet obfuscation using XOR with random key
+        Format: [1 byte key][obfuscated data]
+        """
+        if len(data) == 0:
+            return data
+        
+        # Generate random key
+        key = random.randint(1, 255)
+        
+        # XOR obfuscation
+        obfuscated = bytes([b ^ key for b in data])
+        
+        # Prepend key
+        return bytes([key]) + obfuscated
+    
+    def deobfuscate_packet(self, data):
+        """Remove obfuscation"""
+        if len(data) < 2:
+            return data
+        
+        try:
+            key = data[0]
+            deobfuscated = bytes([b ^ key for b in data[1:]])
+            return deobfuscated
+        except:
+            return data
+    
+    def add_random_padding(self, data, max_padding=32):
+        """
+        Add random padding to break size patterns
+        Format: [2 bytes length][data][padding]
+        """
+        if len(data) > 1400:  # Don't pad large packets
+            return data
+        
+        padding_size = random.randint(0, max_padding)
+        padding = os.urandom(padding_size)
+        
+        # Pack: original length (2 bytes) + data + padding
+        packed = struct.pack('!H', len(data)) + data + padding
+        return packed
+    
+    def remove_padding(self, data):
+        """Remove padding and extract original data"""
+        if len(data) < 2:
+            return data
+        
+        try:
+            # Unpack: get original length
+            original_length = struct.unpack('!H', data[:2])[0]
+            
+            # Extract original data
+            if original_length > 0 and len(data) >= (2 + original_length):
+                return data[2:2+original_length]
+            
+            return data[2:]  # Fallback
+        except:
+            return data
+    
+    def create_backend_connection(self):
+        """Create new backend connection with timeout and retry"""
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                backend_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                
+                # Set socket options for better performance
+                backend_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                backend_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                
+                # Set timeout
+                backend_sock.settimeout(10)
+                
+                # Connect
+                backend_sock.connect((self.backend_host, self.backend_port))
+                
+                # Set non-blocking
+                backend_sock.setblocking(0)
+                
+                return backend_sock
+            
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    raise e
+    
+    def handle_client(self, client_sock, client_addr):
+        """Handle client connection with advanced anti-DPI"""
+        conn_id = f"{client_addr[0]}:{client_addr[1]}"
+        print(f"[+] New connection: {conn_id}")
+        
+        self.stats['total_connections'] += 1
+        
+        backend_sock = None
+        last_rotation = time.time()
+        buffer_client = deque()
+        buffer_backend = deque()
+        
+        try:
+            client_sock.setblocking(0)
+            client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
+            while self.running:
+                current_time = time.time()
+                
+                # Connection rotation logic
+                if backend_sock is None or (current_time - last_rotation) > self.rotation_interval:
+                    if backend_sock:
+                        print(f"[~] Rotating connection: {conn_id}")
+                        self.stats['rotations'] += 1
+                        backend_sock.close()
+                    
+                    try:
+                        backend_sock = self.create_backend_connection()
+                        last_rotation = current_time
+                        print(f"[+] Backend connected: {conn_id}")
+                    except Exception as e:
+                        print(f"[-] Backend connection failed: {e}")
+                        time.sleep(1)
+                        continue
+                
+                # Select for I/O
+                readable, writable, exceptional = select.select(
+                    [client_sock, backend_sock],
+                    [client_sock if buffer_backend else None, 
+                     backend_sock if buffer_client else None],
+                    [client_sock, backend_sock],
+                    0.5
+                )
+                
+                if exceptional:
+                    print(f"[!] Socket exception: {conn_id}")
+                    break
+                
+                # Read from sockets
+                for sock in readable:
+                    try:
+                        data = sock.recv(8192)
+                        if not data:
+                            print(f"[!] Connection closed by peer: {conn_id}")
+                            return
+                        
+                        if sock is client_sock:
+                            # Client -> Backend
+                            self.stats['total_bytes_received'] += len(data)
+                            
+                            # Apply anti-DPI techniques
+                            # 1. Chunk randomization
+                            chunks = self.chunk_randomize(data)
+                            for chunk in chunks:
+                                buffer_client.append(chunk)
+                                self.random_delay()  # Random timing
+                        else:
+                            # Backend -> Client
+                            self.stats['total_bytes_sent'] += len(data)
+                            buffer_backend.append(data)
+                    
+                    except BlockingIOError:
+                        continue
+                    except Exception as e:
+                        print(f"[-] Read error: {e}")
+                        return
+                
+                # Write to sockets
+                if buffer_client and backend_sock in writable:
+                    try:
+                        chunk = buffer_client.popleft()
+                        backend_sock.sendall(chunk)
+                    except BlockingIOError:
+                        buffer_client.appendleft(chunk)
+                    except Exception as e:
+                        print(f"[-] Backend write error: {e}")
+                        return
+                
+                if buffer_backend and client_sock in writable:
+                    try:
+                        data = buffer_backend.popleft()
+                        client_sock.sendall(data)
+                    except BlockingIOError:
+                        buffer_backend.appendleft(data)
+                    except Exception as e:
+                        print(f"[-] Client write error: {e}")
+                        return
+        
+        except Exception as e:
+            print(f"[-] Connection error {conn_id}: {e}")
+        
+        finally:
+            print(f"[-] Closed connection: {conn_id}")
+            if backend_sock:
+                backend_sock.close()
+            client_sock.close()
+            if conn_id in self.active_connections:
+                del self.active_connections[conn_id]
+    
+    def print_stats(self):
+        """Periodically print statistics"""
+        while self.running:
+            time.sleep(60)  # Every minute
+            print(f"\n[STATS] Connections: {self.stats['total_connections']} | "
+                  f"Rotations: {self.stats['rotations']} | "
+                  f"RX: {self.stats['total_bytes_received'] / 1024 / 1024:.2f}MB | "
+                  f"TX: {self.stats['total_bytes_sent'] / 1024 / 1024:.2f}MB\n")
+    
+    def start(self):
+        """Start the proxy server"""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        # Optimize for many connections
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 524288)
+        
+        server.bind(('0.0.0.0', self.listen_port))
+        server.listen(200)  # High backlog for many clients
+        
+        print(f"╔════════════════════════════════════════════════════╗")
+        print(f"║   FlowTunnel Advanced Anti-DPI Daemon v2.0        ║")
+        print(f"╚════════════════════════════════════════════════════╝")
+        print(f"[*] Listen: 0.0.0.0:{self.listen_port}")
+        print(f"[*] Backend: {self.backend_host}:{self.backend_port}")
+        print(f"[*] Rotation: {self.rotation_interval}s")
+        print(f"[*] Features: Chunk randomization, Random delays")
+        print(f"╔════════════════════════════════════════════════════╗\n")
+        
+        def signal_handler(sig, frame):
+            print("\n[!] Shutting down gracefully...")
+            self.running = False
+            server.close()
+            
+            # Print final stats
+            print(f"\n[FINAL STATS]")
+            print(f"  Total Connections: {self.stats['total_connections']}")
+            print(f"  Total Rotations: {self.stats['rotations']}")
+            print(f"  Data Received: {self.stats['total_bytes_received'] / 1024 / 1024:.2f} MB")
+            print(f"  Data Sent: {self.stats['total_bytes_sent'] / 1024 / 1024:.2f} MB")
+            print(f"\nGoodbye!\n")
+            
+            sys.exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Start stats thread
+        stats_thread = threading.Thread(target=self.print_stats, daemon=True)
+        stats_thread.start()
+        
+        try:
+            while self.running:
+                try:
+                    client_sock, client_addr = server.accept()
+                    
+                    # Create handler thread
+                    thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_sock, client_addr),
+                        daemon=True
+                    )
+                    thread.start()
+                
+                except Exception as e:
+                    if self.running:
+                        print(f"[-] Accept error: {e}")
+                        time.sleep(0.1)
+        
+        finally:
+            server.close()
+
+if __name__ == "__main__":
+    if len(sys.argv) != 5:
+        print("╔════════════════════════════════════════════════════╗")
+        print("║   FlowTunnel Advanced Anti-DPI Daemon             ║")
+        print("╚════════════════════════════════════════════════════╝")
+        print("\nUsage:")
+        print("  flowtunnel-daemon <listen_port> <backend_ip> <backend_port> <rotation_sec>")
+        print("\nExample:")
+        print("  flowtunnel-daemon 443 192.168.1.100 8443 30")
+        print("\nParameters:")
+        print("  listen_port     : Port to listen on")
+        print("  backend_ip      : Backend server IP")
+        print("  backend_port    : Backend server port")
+        print("  rotation_sec    : Connection rotation interval (seconds)")
+        print("")
+        sys.exit(1)
+    
+    try:
+        listen_port = int(sys.argv[1])
+        backend_host = sys.argv[2]
+        backend_port = int(sys.argv[3])
+        rotation_interval = int(sys.argv[4])
+        
+        if not (1 <= listen_port <= 65535 and 1 <= backend_port <= 65535):
+            print("[-] Invalid port number (must be 1-65535)")
+            sys.exit(1)
+        
+        if rotation_interval < 5:
+            print("[-] Rotation interval too short (minimum 5 seconds)")
+            sys.exit(1)
+        
+        rotator = AdvancedRotator(listen_port, backend_host, backend_port, rotation_interval)
+        rotator.start()
+    
+    except ValueError:
+        print("[-] Invalid argument format")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted")
+        sys.exit(0)
+    except Exception as e:
+        print(f"[-] Fatal error: {e}")
+        sys.exit(1)
