@@ -21,7 +21,7 @@ echo "📥 Downloading FlowTunnel..."
 
 # Try wget first, then curl
 if command -v wget &> /dev/null; then
-    if ! wget -q --show-progress https://raw.githubusercontent.com/skyboy6/flowtunnel/flowtunnel.sh -O /usr/local/bin/flowtunnel 2>/dev/null; then
+    if ! wget -q --show-progress https://raw.githubusercontent.com/skyboy610/flowtunnel/flowtunnel.sh -O /usr/local/bin/flowtunnel 2>/dev/null; then
         echo "⚠️  Using local installation method..."
         # If download fails, use the current directory
         if [[ -f "./flowtunnel.sh" ]]; then
@@ -32,7 +32,7 @@ if command -v wget &> /dev/null; then
         fi
     fi
 elif command -v curl &> /dev/null; then
-    if ! curl -# -L https://raw.githubusercontent.com/skyboy6/flowtunnel/flowtunnel.sh -o /usr/local/bin/flowtunnel 2>/dev/null; then
+    if ! curl -# -L https://raw.githubusercontent.com/skyboy610/flowtunnel/flowtunnel.sh -o /usr/local/bin/flowtunnel 2>/dev/null; then
         echo "⚠️  Using local installation method..."
         if [[ -f "./flowtunnel.sh" ]]; then
             cp ./flowtunnel.sh /usr/local/bin/flowtunnel
